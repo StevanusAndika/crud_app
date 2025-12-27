@@ -1,4 +1,4 @@
-name = "crud-worker-d1"
+name = "crudapp"
 main = "src/worker.js"
 compatibility_date = "2024-12-27"
 
