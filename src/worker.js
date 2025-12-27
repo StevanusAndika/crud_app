@@ -18,6 +18,24 @@ export default {
       });
     }
 
+    // Rate limiting hanya untuk endpoint API (kecuali GET)
+    if (path.startsWith('/api/items') && method !== 'GET') {
+      const rateLimitResult = await checkRateLimit(request, env);
+      if (rateLimitResult.limited) {
+        return new Response(JSON.stringify({
+          error: 'Rate limit exceeded',
+          message: 'Too many requests. Please try again later.',
+          retryAfter: Math.ceil((rateLimitResult.resetTime - Date.now()) / 1000)
+        }), {
+          status: 429,
+          headers: {
+            'Content-Type': 'application/json',
+            ...corsHeaders,
+          },
+        });
+      }
+    }
+
     // API Routes
     if (path.startsWith('/api/items')) {
       return handleItemsAPI(request, env.DB, corsHeaders);
@@ -52,6 +70,89 @@ export default {
     });
   },
 };
+
+// Rate limiting configuration
+const RATE_LIMIT_WINDOW = 1000; // 1 detik dalam milidetik
+const MAX_REQUESTS_PER_WINDOW = 2; // Maksimal 2 request per window
+
+// Fungsi untuk rate limiting
+async function checkRateLimit(request, env) {
+  try {
+    // Dapatkan IP address client
+    const clientIP = request.headers.get('CF-Connecting-IP') || 
+                     request.headers.get('X-Forwarded-For') || 
+                     'anonymous';
+    
+    // Buat key unik berdasarkan IP dan timestamp window
+    const now = Date.now();
+    const windowKey = Math.floor(now / RATE_LIMIT_WINDOW);
+    const rateLimitKey = `rate_limit:${clientIP}:${windowKey}`;
+    
+    // Gunakan KV untuk rate limiting
+    if (env.RATE_LIMIT_KV) {
+      // Coba increment counter di KV
+      const kv = env.RATE_LIMIT_KV;
+      let currentCount = await kv.get(rateLimitKey, { type: 'text' });
+      
+      if (!currentCount) {
+        // Jika tidak ada entry, buat baru dengan TTL 2 detik (lebih lama dari window)
+        await kv.put(rateLimitKey, '1', { expirationTtl: 2 });
+        currentCount = 1;
+      } else {
+        currentCount = parseInt(currentCount);
+        if (currentCount >= MAX_REQUESTS_PER_WINDOW) {
+          return {
+            limited: true,
+            resetTime: (windowKey + 1) * RATE_LIMIT_WINDOW
+          };
+        }
+        // Increment counter
+        await kv.put(rateLimitKey, (currentCount + 1).toString(), { expirationTtl: 2 });
+      }
+    } else {
+      // Fallback ke in-memory rate limiting jika KV tidak tersedia
+      // PERHATIAN: Ini hanya untuk development, tidak untuk production
+      console.warn('RATE_LIMIT_KV not configured, using in-memory rate limiting');
+      
+      // In-memory store (reset setiap worker restart)
+      if (!globalThis.rateLimitStore) {
+        globalThis.rateLimitStore = new Map();
+      }
+      
+      const entry = globalThis.rateLimitStore.get(rateLimitKey);
+      
+      if (!entry) {
+        globalThis.rateLimitStore.set(rateLimitKey, {
+          count: 1,
+          expires: now + RATE_LIMIT_WINDOW * 2
+        });
+      } else {
+        if (entry.count >= MAX_REQUESTS_PER_WINDOW) {
+          return {
+            limited: true,
+            resetTime: (windowKey + 1) * RATE_LIMIT_WINDOW
+          };
+        }
+        entry.count++;
+      }
+      
+      // Cleanup expired entries setiap 100 request
+      if (Math.random() < 0.01) {
+        for (const [key, value] of globalThis.rateLimitStore.entries()) {
+          if (value.expires < now) {
+            globalThis.rateLimitStore.delete(key);
+          }
+        }
+      }
+    }
+    
+    return { limited: false };
+  } catch (error) {
+    console.error('Rate limiting error:', error);
+    // Jika rate limiting gagal, tetap izinkan request (fail open)
+    return { limited: false };
+  }
+}
 
 async function handleItemsAPI(request, db, corsHeaders) {
   const url = new URL(request.url);
@@ -245,10 +346,10 @@ async function handleItemsAPI(request, db, corsHeaders) {
             status: 400,
             headers: {
               'Content-Type': 'application/json',
-              ...corsHeaders,
-            },
-          });
-        }
+                ...corsHeaders,
+              },
+            });
+          }
 
       case 'DELETE':
         // Delete item
@@ -735,6 +836,12 @@ function getHTML() {
             border-left-color: #4299e1;
         }
 
+        .alert-warning {
+            background: #fffaf0;
+            color: #744210;
+            border-left-color: #ed8936;
+        }
+
         .loading {
             text-align: center;
             padding: 40px 20px;
@@ -860,6 +967,15 @@ function getHTML() {
             opacity: 0.8;
         }
 
+        .rate-limit-info {
+            background: rgba(255,255,255,0.1);
+            border-radius: 8px;
+            padding: 10px 15px;
+            margin-top: 10px;
+            font-size: 0.9rem;
+            border-left: 3px solid #ed8936;
+        }
+
         @media (max-width: 768px) {
             body {
                 padding: 15px;
@@ -899,18 +1015,23 @@ function getHTML() {
         <div class="header">
             <h1>
                 <i class="fas fa-database"></i>
-                CRUD App
+                CRUD App with Rate Limiter
                 <i class="fas fa-server"></i>
             </h1>
-            <p>Cloudflare Worker + D1 Database | Full JSON API with RESTful endpoints</p>
+            <p>Cloudflare Worker + D1 Database | Rate Limit: 2 requests/second for POST/PUT/DELETE</p>
             
             <div class="api-info">
                 <h3><i class="fas fa-code"></i> API Endpoints</h3>
                 <div class="endpoint">GET <strong>/api/items</strong> - Get all items (with pagination: ?page=1&limit=10)</div>
                 <div class="endpoint">GET <strong>/api/items/:id</strong> - Get single item by ID</div>
-                <div class="endpoint">POST <strong>/api/items</strong> - Create new item</div>
-                <div class="endpoint">PUT <strong>/api/items/:id</strong> - Update item by ID</div>
-                <div class="endpoint">DELETE <strong>/api/items/:id</strong> - Delete item by ID</div>
+                <div class="endpoint">POST <strong>/api/items</strong> - Create new item <span style="color:#ed8936;">(Rate Limited)</span></div>
+                <div class="endpoint">PUT <strong>/api/items/:id</strong> - Update item by ID <span style="color:#ed8936;">(Rate Limited)</span></div>
+                <div class="endpoint">DELETE <strong>/api/items/:id</strong> - Delete item by ID <span style="color:#ed8936;">(Rate Limited)</span></div>
+                
+                <div class="rate-limit-info">
+                    <i class="fas fa-exclamation-triangle"></i> 
+                    <strong>Rate Limiting Active:</strong> Maximum 2 requests per second for POST, PUT, DELETE operations. GET requests are not limited.
+                </div>
             </div>
         </div>
 
@@ -987,8 +1108,8 @@ function getHTML() {
         </div>
 
         <div class="footer">
-            <p>Built with Cloudflare Workers + D1 Database | REST API CRUD Application</p>
-            <p>Database Schema: <code>items(id, name, description, created_at)</code></p>
+            <p>Built with Cloudflare Workers + D1 Database | REST API CRUD Application with Rate Limiting</p>
+            <p>Database Schema: <code>items(id, name, description, created_at)</code> | Rate Limit: 2 req/sec for write operations</p>
         </div>
     </div>
 
@@ -1226,6 +1347,9 @@ function getHTML() {
                     
                     if (response.ok) {
                         showAlert('✅ Item updated successfully!', 'success');
+                    } else if (response.status === 429) {
+                        // Rate limit exceeded
+                        throw new Error('Rate limit exceeded: ' + (result.message || 'Too many requests'));
                     } else {
                         throw new Error(result.error || 'Update failed with status ' + response.status);
                     }
@@ -1244,6 +1368,9 @@ function getHTML() {
                     
                     if (response.status === 201) {
                         showAlert('✅ Item created successfully!', 'success');
+                    } else if (response.status === 429) {
+                        // Rate limit exceeded
+                        throw new Error('Rate limit exceeded: ' + (result.message || 'Too many requests'));
                     } else {
                         throw new Error(result.error || 'Creation failed with status ' + response.status);
                     }
@@ -1257,7 +1384,11 @@ function getHTML() {
                 
             } catch (error) {
                 console.error('Error saving item:', error);
-                showAlert('❌ Error: ' + error.message, 'error');
+                if (error.message.includes('Rate limit exceeded')) {
+                    showAlert('⚠️ Rate Limit Exceeded: ' + error.message + '. Please wait a moment and try again.', 'warning');
+                } else {
+                    showAlert('❌ Error: ' + error.message, 'error');
+                }
                 updateJsonOutput({ error: error.message });
             } finally {
                 submitBtn.disabled = false;
@@ -1299,13 +1430,20 @@ function getHTML() {
                     
                     // Reload items
                     loadItems(currentPage);
+                } else if (response.status === 429) {
+                    // Rate limit exceeded
+                    throw new Error('Rate limit exceeded: ' + (result.message || 'Too many requests'));
                 } else {
                     throw new Error(result.error || 'Delete failed with status ' + response.status);
                 }
                 
             } catch (error) {
                 console.error('Error deleting item:', error);
-                showAlert('❌ Error deleting item: ' + error.message, 'error');
+                if (error.message.includes('Rate limit exceeded')) {
+                    showAlert('⚠️ Rate Limit Exceeded: ' + error.message + '. Please wait a moment and try again.', 'warning');
+                } else {
+                    showAlert('❌ Error deleting item: ' + error.message, 'error');
+                }
                 updateJsonOutput({ error: error.message });
             } finally {
                 if (deleteBtn) deleteBtn.disabled = false;
@@ -1365,3 +1503,6 @@ function getHTML() {
 </html>`;
 }
 
+function getSchemaSQL() {
+  
+}
