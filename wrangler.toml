@@ -1,0 +1,8 @@
+name = "crud-worker-d1"
+main = "src/worker.js"
+compatibility_date = "2024-12-27"
+
+[[d1_databases]]
+binding = "DB"
+database_name = "crud-db"
+database_id = "b3b5b68e-07cb-4e03-a584-863e2cf1bf33"

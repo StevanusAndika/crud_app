@@ -1,0 +1,113 @@
+# Dependencies
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+.pnpm-debug.log*
+
+# Runtime data
+pids
+*.pid
+*.seed
+*.pid.lock
+
+# Cloudflare Workers specific
+.wrangler/
+.wrangler/
+dist/
+.build/
+.output/
+
+# Environment variables
+.env
+.env.local
+.env.development.local
+.env.test.local
+.env.production.local
+
+# Cloudflare configuration secrets
+wrangler.toml  # Jangan commit yang berisi secrets!
+.env.production
+.env.staging
+
+# Development & build outputs
+.cache/
+.tmp/
+.temp/
+coverage/
+*.tgz
+
+# Editor/IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# OS generated files
+*.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# Logs
+*.log
+logs/
+
+# Testing
+/test-reports/
+/coverage/
+.nyc_output/
+
+# Package managers
+package-lock.json
+yarn.lock
+pnpm-lock.yaml
+bun.lockb
+
+# Cloudflare specific
+.cf/
+.d1/
+.r2/
+
+# TypeScript
+*.tsbuildinfo
+dist-ssr/
+*.js.map
+*.css.map
+
+# Optional: jika menggunakan TypeScript
+*.tsbuildinfo
+*.tsbuildinfo.*
+
+# Optional: jika menggunakan bundler seperti webpack/esbuild
+/dist/
+/build/
+
+# Optional: jika menggunakan database local
+*.db
+*.sqlite
+*.sqlite3
+
+# Optional: jika menggunakan uploads/files
+uploads/
+temp/
+tmp/
+
+# Laragon specific (karena Anda pakai Laragon)
+/laragon/
+/www/
+/tmp/
+/logs/
+
+# Project specific exclusions
+# Jangan commit file yang berisi API keys, database IDs, dll
+secrets.ini
+config.local.json
+credentials.json
+firebase-key.json

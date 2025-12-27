@@ -1,0 +1,13 @@
+{
+  "name": "crud-worker-d1",
+  "version": "1.0.0",
+  "description": "CRUD app with Cloudflare Workers and D1",
+  "main": "src/worker.js",
+  "scripts": {
+    "deploy": "wrangler deploy",
+    "dev": "wrangler dev"
+  },
+  "devDependencies": {
+    "wrangler": "^4.54.0"
+  }
+}

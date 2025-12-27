@@ -1,0 +1,13 @@
+# .github/workflows/deploy.yml
+name: Deploy
+on: [push]
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+      - name: Deploy to Cloudflare Workers
+        uses: cloudflare/wrangler-action@v2
+        with:
+          apiToken: ${{ secrets.CF_API_TOKEN }}
+          # Secrets disimpan di GitHub, bukan di file
