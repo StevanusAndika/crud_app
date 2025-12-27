@@ -8,12 +8,14 @@ export default {
     const corsHeaders = {
       'Access-Control-Allow-Origin': '*',
       'Access-Control-Allow-Methods': 'GET, POST, PUT, DELETE, OPTIONS',
-      'Access-Control-Allow-Headers': 'Content-Type',
+      'Access-Control-Allow-Headers': 'Content-Type, Authorization',
     };
 
     // Handle CORS preflight
     if (method === 'OPTIONS') {
-      return new Response(null, { headers: corsHeaders });
+      return new Response(null, {
+        headers: corsHeaders,
+      });
     }
 
     // API Routes
@@ -21,9 +23,32 @@ export default {
       return handleItemsAPI(request, env.DB, corsHeaders);
     }
 
-    // Serve HTML
-    return new Response(getHTML(), {
-      headers: { 'Content-Type': 'text/html', ...corsHeaders },
+    // Serve HTML for root path
+    if (path === '/') {
+      return new Response(getHTML(), {
+        headers: {
+          'Content-Type': 'text/html',
+          ...corsHeaders,
+        },
+      });
+    }
+
+    // Serve schema SQL
+    if (path === '/schema.sql') {
+      return new Response(getSchemaSQL(), {
+        headers: {
+          'Content-Type': 'text/sql',
+          ...corsHeaders,
+        },
+      });
+    }
+
+    return new Response(JSON.stringify({ error: 'Not found' }), {
+      status: 404,
+      headers: {
+        'Content-Type': 'application/json',
+        ...corsHeaders,
+      },
     });
   },
 };
@@ -32,79 +57,271 @@ async function handleItemsAPI(request, db, corsHeaders) {
   const url = new URL(request.url);
   const path = url.pathname;
   const method = request.method;
-  const id = path.split('/')[3];
+  
+  // Extract ID from path: /api/items/{id}
+  const pathParts = path.split('/').filter(part => part.length > 0);
+  const id = pathParts.length === 3 ? pathParts[2] : null;
 
   try {
     switch (method) {
       case 'GET':
         if (id) {
+          // Get single item by ID
           const item = await db.prepare('SELECT * FROM items WHERE id = ?').bind(id).first();
-          return jsonResponse(item || { error: 'Item not found' }, corsHeaders);
+          if (!item) {
+            return new Response(JSON.stringify({ error: 'Item not found' }), {
+              status: 404,
+              headers: {
+                'Content-Type': 'application/json',
+                ...corsHeaders,
+              },
+            });
+          }
+          return new Response(JSON.stringify(item), {
+            headers: {
+              'Content-Type': 'application/json',
+              ...corsHeaders,
+            },
+          });
         } else {
-          const items = await db.prepare('SELECT * FROM items ORDER BY created_at DESC').all();
-          return jsonResponse(items.results, corsHeaders);
+          // Get all items with pagination
+          const searchParams = url.searchParams;
+          const page = parseInt(searchParams.get('page') || '1');
+          const limit = parseInt(searchParams.get('limit') || '10');
+          const offset = (page - 1) * limit;
+          
+          // Get total count
+          const countResult = await db.prepare('SELECT COUNT(*) as total FROM items').first();
+          const total = countResult ? countResult.total : 0;
+          
+          // Get paginated items
+          const items = await db.prepare(
+            'SELECT * FROM items ORDER BY created_at DESC LIMIT ? OFFSET ?'
+          ).bind(limit, offset).all();
+          
+          return new Response(JSON.stringify({
+            items: items.results || [],
+            pagination: {
+              page,
+              limit,
+              total,
+              pages: Math.ceil(total / limit) || 1
+            }
+          }), {
+            headers: {
+              'Content-Type': 'application/json',
+              ...corsHeaders,
+            },
+          });
         }
 
       case 'POST':
-        const { name, description } = await request.json();
-        if (!name) return jsonResponse({ error: 'Name is required' }, corsHeaders, 400);
-        
-        const result = await db.prepare('INSERT INTO items (name, description) VALUES (?, ?)')
-          .bind(name, description).run();
-        
-        return jsonResponse({ 
-          id: result.meta.last_row_id, 
-          name, 
-          description,
-          message: 'Item created successfully' 
-        }, corsHeaders, 201);
+        // Create new item
+        try {
+          const data = await request.json();
+          const { name, description } = data;
+          
+          if (!name || name.trim() === '') {
+            return new Response(JSON.stringify({ 
+              error: 'Name is required',
+              details: 'Please provide a valid name for the item'
+            }), {
+              status: 400,
+              headers: {
+                'Content-Type': 'application/json',
+                ...corsHeaders,
+              },
+            });
+          }
+
+          const result = await db.prepare(
+            'INSERT INTO items (name, description) VALUES (?, ?)'
+          ).bind(name.trim(), description ? description.trim() : null).run();
+
+          // Get the created item
+          const createdItem = await db.prepare(
+            'SELECT * FROM items WHERE id = ?'
+          ).bind(result.meta.last_row_id).first();
+
+          return new Response(JSON.stringify({
+            success: true,
+            message: 'Item created successfully',
+            item: createdItem
+          }), {
+            status: 201,
+            headers: {
+              'Content-Type': 'application/json',
+              ...corsHeaders,
+            },
+          });
+        } catch (jsonError) {
+          return new Response(JSON.stringify({ 
+            error: 'Invalid JSON data',
+            details: 'Please provide valid JSON in the request body'
+          }), {
+            status: 400,
+            headers: {
+              'Content-Type': 'application/json',
+              ...corsHeaders,
+            },
+          });
+        }
 
       case 'PUT':
-        if (!id) return jsonResponse({ error: 'ID is required' }, corsHeaders, 400);
-        
-        const { name: updateName, description: updateDesc } = await request.json();
-        
-        // Cek jika item exists
-        const existing = await db.prepare('SELECT * FROM items WHERE id = ?').bind(id).first();
-        if (!existing) return jsonResponse({ error: 'Item not found' }, corsHeaders, 404);
-        
-        await db.prepare('UPDATE items SET name = ?, description = ? WHERE id = ?')
-          .bind(updateName, updateDesc, id).run();
-        
-        return jsonResponse({ 
-          message: 'Item updated successfully',
-          id,
-          name: updateName,
-          description: updateDesc
-        }, corsHeaders);
+        // Update existing item
+        if (!id) {
+          return new Response(JSON.stringify({ 
+            error: 'ID is required',
+            details: 'Please provide an item ID in the URL'
+          }), {
+            status: 400,
+            headers: {
+              'Content-Type': 'application/json',
+              ...corsHeaders,
+            },
+          });
+        }
+
+        try {
+          const data = await request.json();
+          const { name, description } = data;
+          
+          if (!name || name.trim() === '') {
+            return new Response(JSON.stringify({ 
+              error: 'Name is required',
+              details: 'Please provide a valid name for the item'
+            }), {
+              status: 400,
+              headers: {
+                'Content-Type': 'application/json',
+                ...corsHeaders,
+              },
+            });
+          }
+
+          // Check if item exists
+          const existingItem = await db.prepare(
+            'SELECT * FROM items WHERE id = ?'
+          ).bind(id).first();
+          
+          if (!existingItem) {
+            return new Response(JSON.stringify({ 
+              error: 'Item not found',
+              details: `Item with ID ${id} does not exist`
+            }), {
+              status: 404,
+              headers: {
+                'Content-Type': 'application/json',
+                ...corsHeaders,
+              },
+            });
+          }
+
+          // Update item
+          const updateResult = await db.prepare(
+            'UPDATE items SET name = ?, description = ? WHERE id = ?'
+          ).bind(name.trim(), description ? description.trim() : null, id).run();
+
+          // Get the updated item
+          const updatedItem = await db.prepare(
+            'SELECT * FROM items WHERE id = ?'
+          ).bind(id).first();
+
+          return new Response(JSON.stringify({
+            success: true,
+            message: 'Item updated successfully',
+            item: updatedItem
+          }), {
+            headers: {
+              'Content-Type': 'application/json',
+              ...corsHeaders,
+            },
+          });
+        } catch (jsonError) {
+          return new Response(JSON.stringify({ 
+            error: 'Invalid JSON data',
+            details: 'Please provide valid JSON in the request body'
+          }), {
+            status: 400,
+            headers: {
+              'Content-Type': 'application/json',
+              ...corsHeaders,
+            },
+          });
+        }
 
       case 'DELETE':
-        if (!id) return jsonResponse({ error: 'ID is required' }, corsHeaders, 400);
+        // Delete item
+        if (!id) {
+          return new Response(JSON.stringify({ 
+            error: 'ID is required',
+            details: 'Please provide an item ID in the URL'
+          }), {
+            status: 400,
+            headers: {
+              'Content-Type': 'application/json',
+              ...corsHeaders,
+            },
+          });
+        }
+
+        // Check if item exists
+        const existingItem = await db.prepare(
+          'SELECT * FROM items WHERE id = ?'
+        ).bind(id).first();
         
-        // Cek jika item exists
-        const itemToDelete = await db.prepare('SELECT * FROM items WHERE id = ?').bind(id).first();
-        if (!itemToDelete) return jsonResponse({ error: 'Item not found' }, corsHeaders, 404);
-        
+        if (!existingItem) {
+          return new Response(JSON.stringify({ 
+            error: 'Item not found',
+            details: `Item with ID ${id} does not exist`
+          }), {
+            status: 404,
+            headers: {
+              'Content-Type': 'application/json',
+              ...corsHeaders,
+            },
+          });
+        }
+
+        // Delete item
         await db.prepare('DELETE FROM items WHERE id = ?').bind(id).run();
-        
-        return jsonResponse({ 
+
+        return new Response(JSON.stringify({
+          success: true,
           message: 'Item deleted successfully',
-          id 
-        }, corsHeaders);
+          deletedItem: existingItem
+        }), {
+          headers: {
+            'Content-Type': 'application/json',
+            ...corsHeaders,
+          },
+        });
 
       default:
-        return jsonResponse({ error: 'Method not allowed' }, corsHeaders, 405);
+        return new Response(JSON.stringify({ 
+          error: 'Method not allowed',
+          allowed: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS']
+        }), {
+          status: 405,
+          headers: {
+            'Content-Type': 'application/json',
+            ...corsHeaders,
+          },
+        });
     }
   } catch (error) {
-    return jsonResponse({ error: error.message }, corsHeaders, 500);
+    console.error('Database error:', error);
+    return new Response(JSON.stringify({ 
+      error: 'Internal server error',
+      details: error.message 
+    }), {
+      status: 500,
+      headers: {
+        'Content-Type': 'application/json',
+        ...corsHeaders,
+      },
+    });
   }
-}
-
-function jsonResponse(data, headers, status = 200) {
-  return new Response(JSON.stringify(data, null, 2), {
-    status,
-    headers: { 'Content-Type': 'application/json', ...headers },
-  });
 }
 
 function getHTML() {
@@ -113,11 +330,8 @@ function getHTML() {
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>CRUD App with SweetAlert</title>
-    
-    <!-- SweetAlert CSS -->
-    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/sweetalert2@11/dist/sweetalert2.min.css">
-    
+    <title>CRUD App - Cloudflare Worker + D1</title>
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
     <style>
         * {
             margin: 0;
@@ -126,328 +340,376 @@ function getHTML() {
         }
 
         body {
-            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
-            background: linear-gradient(135deg, #6a11cb 0%, #2575fc 100%);
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, sans-serif;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
             min-height: 100vh;
             padding: 20px;
             color: #333;
         }
 
         .container {
-            max-width: 1200px;
+            max-width: 1400px;
             margin: 0 auto;
-            background: rgba(255, 255, 255, 0.95);
-            border-radius: 20px;
-            padding: 30px;
-            box-shadow: 0 15px 35px rgba(0, 0, 0, 0.2);
         }
 
         .header {
             text-align: center;
-            margin-bottom: 40px;
-            padding-bottom: 20px;
-            border-bottom: 2px solid #eee;
+            margin-bottom: 30px;
+            color: white;
+            text-shadow: 0 2px 4px rgba(0,0,0,0.2);
         }
 
         .header h1 {
-            color: #2c3e50;
             font-size: 2.8rem;
             margin-bottom: 10px;
-            background: linear-gradient(90deg, #6a11cb, #2575fc);
-            -webkit-background-clip: text;
-            -webkit-text-fill-color: transparent;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            gap: 15px;
         }
 
         .header p {
-            color: #7f8c8d;
+            opacity: 0.9;
             font-size: 1.1rem;
+            max-width: 600px;
+            margin: 0 auto;
+            line-height: 1.6;
         }
 
-        .app-grid {
+        .api-info {
+            background: rgba(255,255,255,0.1);
+            backdrop-filter: blur(10px);
+            border-radius: 10px;
+            padding: 15px;
+            margin: 20px auto;
+            max-width: 800px;
+            border: 1px solid rgba(255,255,255,0.2);
+        }
+
+        .api-info h3 {
+            margin-bottom: 10px;
+            color: white;
+        }
+
+        .endpoint {
+            background: rgba(0,0,0,0.2);
+            padding: 10px;
+            border-radius: 5px;
+            margin: 5px 0;
+            font-family: 'Courier New', monospace;
+            color: #fff;
+            font-size: 0.9rem;
+        }
+
+        .app-container {
             display: grid;
             grid-template-columns: 1fr 1fr;
             gap: 30px;
+            margin-bottom: 40px;
         }
 
-        @media (max-width: 900px) {
-            .app-grid {
+        @media (max-width: 1024px) {
+            .app-container {
                 grid-template-columns: 1fr;
             }
         }
 
-        .card {
+        .panel {
             background: white;
-            border-radius: 15px;
-            padding: 25px;
-            box-shadow: 0 10px 20px rgba(0, 0, 0, 0.1);
-            border: 1px solid #e0e0e0;
+            padding: 30px;
+            border-radius: 20px;
+            box-shadow: 0 20px 60px rgba(0,0,0,0.15);
+            transition: transform 0.3s ease;
         }
 
-        .card h2 {
-            color: #2c3e50;
-            margin-bottom: 20px;
+        .panel:hover {
+            transform: translateY(-5px);
+        }
+
+        .panel h2 {
+            color: #2d3748;
+            margin-bottom: 25px;
             padding-bottom: 15px;
-            border-bottom: 2px solid #f0f0f0;
+            border-bottom: 2px solid #e2e8f0;
+            display: flex;
+            align-items: center;
+            gap: 10px;
+        }
+
+        .panel h2 i {
+            color: #667eea;
         }
 
         .form-group {
-            margin-bottom: 20px;
+            margin-bottom: 25px;
         }
 
-        .form-group label {
+        label {
             display: block;
-            margin-bottom: 8px;
+            margin-bottom: 10px;
             font-weight: 600;
-            color: #2c3e50;
+            color: #4a5568;
+            font-size: 1rem;
         }
 
-        .form-control {
+        .required::after {
+            content: " *";
+            color: #e53e3e;
+        }
+
+        input, textarea {
             width: 100%;
-            padding: 12px 15px;
-            border: 2px solid #ddd;
+            padding: 14px;
+            border: 2px solid #e2e8f0;
             border-radius: 10px;
             font-size: 16px;
             transition: all 0.3s;
-            background: #f8f9fa;
+            background: #f8fafc;
         }
 
-        .form-control:focus {
+        input:focus, textarea:focus {
             outline: none;
-            border-color: #6a11cb;
+            border-color: #667eea;
             background: white;
-            box-shadow: 0 0 0 3px rgba(106, 17, 203, 0.1);
+            box-shadow: 0 0 0 3px rgba(102, 126, 234, 0.1);
         }
 
-        textarea.form-control {
+        textarea {
             min-height: 120px;
             resize: vertical;
-            font-family: inherit;
+            line-height: 1.5;
         }
 
-        .btn {
-            padding: 12px 24px;
+        .btn-group {
+            display: flex;
+            gap: 12px;
+            margin-top: 25px;
+            flex-wrap: wrap;
+        }
+
+        button {
+            padding: 14px 28px;
             border: none;
             border-radius: 10px;
             font-size: 16px;
             font-weight: 600;
             cursor: pointer;
-            transition: all 0.3s ease;
-            display: inline-flex;
+            transition: all 0.3s;
+            display: flex;
             align-items: center;
             justify-content: center;
             gap: 8px;
+            min-width: 140px;
+        }
+
+        button:disabled {
+            opacity: 0.6;
+            cursor: not-allowed;
+        }
+
+        button i {
+            font-size: 1.1em;
         }
 
         .btn-primary {
-            background: linear-gradient(135deg, #6a11cb 0%, #2575fc 100%);
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
             color: white;
-        }
-
-        .btn-primary:hover {
-            transform: translateY(-2px);
-            box-shadow: 0 7px 14px rgba(106, 17, 203, 0.3);
-        }
-
-        .btn-success {
-            background: linear-gradient(135deg, #00b09b 0%, #96c93d 100%);
-            color: white;
-        }
-
-        .btn-success:hover {
-            transform: translateY(-2px);
-            box-shadow: 0 7px 14px rgba(0, 176, 155, 0.3);
-        }
-
-        .btn-danger {
-            background: linear-gradient(135deg, #ff416c 0%, #ff4b2b 100%);
-            color: white;
-        }
-
-        .btn-danger:hover {
-            transform: translateY(-2px);
-            box-shadow: 0 7px 14px rgba(255, 65, 108, 0.3);
-        }
-
-        .btn-warning {
-            background: linear-gradient(135deg, #f7971e 0%, #ffd200 100%);
-            color: white;
-        }
-
-        .btn-warning:hover {
-            transform: translateY(-2px);
-            box-shadow: 0 7px 14px rgba(247, 151, 30, 0.3);
-        }
-
-        .btn-secondary {
-            background: #95a5a6;
-            color: white;
-        }
-
-        .btn-secondary:hover {
-            background: #7f8c8d;
-        }
-
-        .btn-group {
-            display: flex;
-            gap: 10px;
-            flex-wrap: wrap;
-            margin-top: 20px;
-        }
-
-        .btn-group .btn {
             flex: 1;
         }
 
-        .item-list {
+        .btn-primary:hover:not(:disabled) {
+            transform: translateY(-2px);
+            box-shadow: 0 10px 20px rgba(102, 126, 234, 0.3);
+        }
+
+        .btn-secondary {
+            background: #48bb78;
+            color: white;
+        }
+
+        .btn-secondary:hover:not(:disabled) {
+            background: #38a169;
+            transform: translateY(-2px);
+            box-shadow: 0 10px 20px rgba(72, 187, 120, 0.3);
+        }
+
+        .btn-update {
+            background: linear-gradient(135deg, #ed8936 0%, #dd6b20 100%);
+            color: white;
+        }
+
+        .btn-update:hover:not(:disabled) {
+            transform: translateY(-2px);
+            box-shadow: 0 10px 20px rgba(237, 137, 54, 0.3);
+        }
+
+        .btn-danger {
+            background: linear-gradient(135deg, #f56565 0%, #e53e3e 100%);
+            color: white;
+        }
+
+        .btn-danger:hover:not(:disabled) {
+            transform: translateY(-2px);
+            box-shadow: 0 10px 20px rgba(245, 101, 101, 0.3);
+        }
+
+        .btn-cancel {
+            background: #a0aec0;
+            color: white;
+        }
+
+        .btn-cancel:hover:not(:disabled) {
+            background: #718096;
+            transform: translateY(-2px);
+        }
+
+        .item-list-container {
             max-height: 600px;
             overflow-y: auto;
             padding-right: 10px;
         }
 
-        .item-list::-webkit-scrollbar {
+        .item-list-container::-webkit-scrollbar {
             width: 8px;
         }
 
-        .item-list::-webkit-scrollbar-track {
+        .item-list-container::-webkit-scrollbar-track {
             background: #f1f1f1;
-            border-radius: 10px;
+            border-radius: 4px;
         }
 
-        .item-list::-webkit-scrollbar-thumb {
-            background: #6a11cb;
-            border-radius: 10px;
+        .item-list-container::-webkit-scrollbar-thumb {
+            background: #cbd5e0;
+            border-radius: 4px;
+        }
+
+        .item-list-container::-webkit-scrollbar-thumb:hover {
+            background: #a0aec0;
+        }
+
+        .list-controls {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 20px;
+            flex-wrap: wrap;
+            gap: 15px;
+        }
+
+        .search-box {
+            flex: 1;
+            min-width: 250px;
+            position: relative;
+        }
+
+        .search-box input {
+            padding-left: 40px;
+        }
+
+        .search-box i {
+            position: absolute;
+            left: 15px;
+            top: 50%;
+            transform: translateY(-50%);
+            color: #a0aec0;
+        }
+
+        .stats {
+            color: #718096;
+            font-size: 0.9rem;
+            background: #f7fafc;
+            padding: 8px 15px;
+            border-radius: 8px;
+            border: 1px solid #e2e8f0;
         }
 
         .item-card {
-            background: #f8f9fa;
+            background: #f8fafc;
+            border: 1px solid #e2e8f0;
             border-radius: 12px;
             padding: 20px;
             margin-bottom: 15px;
-            border-left: 5px solid #6a11cb;
             transition: all 0.3s;
             position: relative;
+            overflow: hidden;
         }
 
         .item-card:hover {
             transform: translateX(5px);
-            box-shadow: 0 5px 15px rgba(0, 0, 0, 0.1);
-            background: white;
+            box-shadow: 0 10px 25px rgba(0,0,0,0.1);
+            border-color: #cbd5e0;
         }
 
-        .item-header {
-            display: flex;
-            justify-content: space-between;
-            align-items: flex-start;
-            margin-bottom: 10px;
-        }
-
-        .item-title {
-            color: #2c3e50;
-            font-size: 1.2rem;
-            font-weight: 600;
-            margin: 0;
+        .item-card.editing {
+            border-color: #ed8936;
+            background: #fffaf0;
         }
 
         .item-id {
-            background: #e0e0e0;
-            color: #7f8c8d;
-            padding: 4px 12px;
+            position: absolute;
+            top: 10px;
+            right: 10px;
+            background: #667eea;
+            color: white;
+            padding: 4px 10px;
             border-radius: 20px;
-            font-size: 12px;
+            font-size: 0.8rem;
             font-weight: 600;
         }
 
-        .item-description {
-            color: #5d6d7e;
-            line-height: 1.6;
+        .item-card h3 {
+            color: #2d3748;
+            margin-bottom: 10px;
+            font-size: 1.3rem;
+            padding-right: 60px;
+        }
+
+        .item-card p {
+            color: #718096;
             margin-bottom: 15px;
+            line-height: 1.6;
+            font-size: 1rem;
         }
 
-        .item-meta {
+        .item-card .meta {
+            font-size: 0.85rem;
+            color: #a0aec0;
+            margin-bottom: 15px;
             display: flex;
-            justify-content: space-between;
             align-items: center;
-            color: #95a5a6;
-            font-size: 13px;
-            margin-top: 15px;
-            padding-top: 15px;
-            border-top: 1px solid #eee;
+            gap: 15px;
         }
 
-        .item-date {
-            display: flex;
-            align-items: center;
-            gap: 5px;
+        .item-card .meta i {
+            font-size: 0.9em;
         }
 
         .item-actions {
             display: flex;
-            gap: 8px;
+            gap: 10px;
+            margin-top: 10px;
         }
 
-        .item-actions .btn {
+        .item-actions button {
             padding: 8px 16px;
-            font-size: 14px;
-            flex: none;
-        }
-
-        .no-items {
-            text-align: center;
-            padding: 40px 20px;
-            color: #95a5a6;
-        }
-
-        .no-items i {
-            font-size: 48px;
-            margin-bottom: 15px;
-            opacity: 0.5;
+            font-size: 0.9rem;
+            min-width: auto;
+            flex: 1;
         }
 
         .alert {
-            padding: 15px 20px;
+            padding: 16px 20px;
             border-radius: 10px;
-            margin-bottom: 20px;
+            margin-bottom: 25px;
             display: none;
             animation: slideIn 0.3s ease;
-        }
-
-        .alert-success {
-            background: #d4edda;
-            color: #155724;
-            border: 1px solid #c3e6cb;
-        }
-
-        .alert-error {
-            background: #f8d7da;
-            color: #721c24;
-            border: 1px solid #f5c6cb;
-        }
-
-        .loading {
-            text-align: center;
-            padding: 30px;
-            color: #6a11cb;
-        }
-
-        .loading-spinner {
-            border: 3px solid #f3f3f3;
-            border-top: 3px solid #6a11cb;
-            border-radius: 50%;
-            width: 40px;
-            height: 40px;
-            animation: spin 1s linear infinite;
-            margin: 0 auto 15px;
-        }
-
-        @keyframes spin {
-            0% { transform: rotate(0deg); }
-            100% { transform: rotate(360deg); }
+            border-left: 4px solid;
         }
 
         @keyframes slideIn {
             from {
                 opacity: 0;
-                transform: translateY(-20px);
+                transform: translateY(-10px);
             }
             to {
                 opacity: 1;
@@ -455,503 +717,651 @@ function getHTML() {
             }
         }
 
-        .json-preview {
-            background: #2c3e50;
-            color: #ecf0f1;
-            padding: 15px;
-            border-radius: 10px;
+        .alert-success {
+            background: #f0fff4;
+            color: #22543d;
+            border-left-color: #48bb78;
+        }
+
+        .alert-error {
+            background: #fff5f5;
+            color: #742a2a;
+            border-left-color: #f56565;
+        }
+
+        .alert-info {
+            background: #ebf8ff;
+            color: #2c5282;
+            border-left-color: #4299e1;
+        }
+
+        .loading {
+            text-align: center;
+            padding: 40px 20px;
+            color: #667eea;
+            font-size: 1.1rem;
+        }
+
+        .loading i {
+            font-size: 2em;
+            margin-bottom: 15px;
+            display: block;
+            animation: spin 1s linear infinite;
+        }
+
+        @keyframes spin {
+            100% { transform: rotate(360deg); }
+        }
+
+        .empty-state {
+            text-align: center;
+            padding: 50px 20px;
+            color: #a0aec0;
+        }
+
+        .empty-state i {
+            font-size: 3em;
+            margin-bottom: 15px;
+            color: #cbd5e0;
+        }
+
+        .json-panel {
+            grid-column: 1 / -1;
             margin-top: 20px;
-            font-family: 'Courier New', monospace;
-            font-size: 13px;
-            max-height: 200px;
+        }
+
+        .json-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 15px;
+        }
+
+        .json-output {
+            background: #1a202c;
+            color: #e2e8f0;
+            border-radius: 10px;
+            padding: 20px;
+            font-family: 'Fira Code', 'Courier New', monospace;
+            font-size: 14px;
+            max-height: 300px;
             overflow-y: auto;
             white-space: pre-wrap;
+            word-break: break-all;
+            line-height: 1.5;
         }
 
-        .form-actions {
+        .json-output::-webkit-scrollbar {
+            width: 8px;
+        }
+
+        .json-output::-webkit-scrollbar-track {
+            background: #2d3748;
+            border-radius: 4px;
+        }
+
+        .json-output::-webkit-scrollbar-thumb {
+            background: #4a5568;
+            border-radius: 4px;
+        }
+
+        .copy-btn {
+            background: #4a5568;
+            color: white;
+            padding: 8px 16px;
+            border-radius: 6px;
+            font-size: 0.9rem;
+            border: none;
+            cursor: pointer;
             display: flex;
+            align-items: center;
+            gap: 5px;
+        }
+
+        .copy-btn:hover {
+            background: #2d3748;
+        }
+
+        .pagination {
+            display: flex;
+            justify-content: center;
+            align-items: center;
             gap: 10px;
             margin-top: 20px;
+            padding-top: 20px;
+            border-top: 1px solid #e2e8f0;
         }
 
-        .hidden {
-            display: none !important;
+        .pagination button {
+            min-width: 40px;
+            padding: 8px 12px;
+            background: #edf2f7;
+            color: #4a5568;
+            border: 1px solid #e2e8f0;
+        }
+
+        .pagination button:hover:not(:disabled) {
+            background: #e2e8f0;
+        }
+
+        .pagination button.active {
+            background: #667eea;
+            color: white;
+            border-color: #667eea;
+        }
+
+        .footer {
+            text-align: center;
+            color: white;
+            margin-top: 40px;
+            padding-top: 20px;
+            border-top: 1px solid rgba(255,255,255,0.1);
+            font-size: 0.9rem;
+            opacity: 0.8;
+        }
+
+        @media (max-width: 768px) {
+            body {
+                padding: 15px;
+            }
+            
+            .header h1 {
+                font-size: 2rem;
+                flex-direction: column;
+                gap: 10px;
+            }
+            
+            .panel {
+                padding: 20px;
+            }
+            
+            .btn-group {
+                flex-direction: column;
+            }
+            
+            button {
+                width: 100%;
+            }
+            
+            .list-controls {
+                flex-direction: column;
+                align-items: stretch;
+            }
+            
+            .search-box {
+                min-width: 100%;
+            }
         }
     </style>
 </head>
 <body>
     <div class="container">
         <div class="header">
-            <h1>✨ CRUD Master</h1>
-            <p>Cloudflare Workers + D1 Database | Beautiful UI with SweetAlert</p>
+            <h1>
+                <i class="fas fa-database"></i>
+                CRUD App
+                <i class="fas fa-server"></i>
+            </h1>
+            <p>Cloudflare Worker + D1 Database | Full JSON API with RESTful endpoints</p>
+            
+            <div class="api-info">
+                <h3><i class="fas fa-code"></i> API Endpoints</h3>
+                <div class="endpoint">GET <strong>/api/items</strong> - Get all items (with pagination: ?page=1&limit=10)</div>
+                <div class="endpoint">GET <strong>/api/items/:id</strong> - Get single item by ID</div>
+                <div class="endpoint">POST <strong>/api/items</strong> - Create new item</div>
+                <div class="endpoint">PUT <strong>/api/items/:id</strong> - Update item by ID</div>
+                <div class="endpoint">DELETE <strong>/api/items/:id</strong> - Delete item by ID</div>
+            </div>
         </div>
 
         <div id="alert" class="alert"></div>
 
-        <div class="app-grid">
-            <!-- Form Section -->
-            <div class="card">
-                <h2>📝 Create / Edit Item</h2>
+        <div class="app-container">
+            <div class="panel">
+                <h2><i class="fas fa-edit"></i> Create/Update Item</h2>
                 <form id="itemForm">
                     <input type="hidden" id="itemId">
-                    
                     <div class="form-group">
-                        <label for="name">Item Name *</label>
-                        <input type="text" id="name" class="form-control" 
-                               placeholder="Enter item name" required>
+                        <label for="name" class="required">Name</label>
+                        <input type="text" id="name" required placeholder="Enter item name">
                     </div>
-                    
                     <div class="form-group">
                         <label for="description">Description</label>
-                        <textarea id="description" class="form-control" 
-                                  placeholder="Enter item description..."></textarea>
+                        <textarea id="description" placeholder="Enter item description"></textarea>
                     </div>
-                    
-                    <div class="form-actions">
-                        <button type="submit" class="btn btn-primary" id="submitBtn">
-                            <span>➕ Create Item</span>
+                    <div class="btn-group">
+                        <button type="submit" class="btn-primary" id="submitBtn">
+                            <i class="fas fa-plus"></i> Create Item
                         </button>
-                        <button type="button" class="btn btn-success hidden" id="updateBtn">
-                            <span>💾 Update Item</span>
+                        <button type="button" class="btn-update" id="updateBtn" style="display: none;">
+                            <i class="fas fa-save"></i> Update Item
                         </button>
-                        <button type="button" class="btn btn-secondary hidden" id="cancelBtn">
-                            <span>❌ Cancel</span>
+                        <button type="button" class="btn-cancel" id="cancelBtn" style="display: none;">
+                            <i class="fas fa-times"></i> Cancel
                         </button>
                     </div>
                 </form>
-
-                <div class="json-preview" id="jsonOutput">
-                    <!-- JSON response will appear here -->
-                </div>
             </div>
 
-            <!-- List Section -->
-            <div class="card">
-                <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 20px;">
-                    <h2 style="margin: 0;">📦 Items List</h2>
-                    <div style="display: flex; gap: 10px;">
-                        <button class="btn btn-success" onclick="loadItems()">
-                            <span>🔄 Refresh</span>
-                        </button>
-                        <button class="btn btn-secondary" onclick="clearForm()">
-                            <span>🧹 Clear Form</span>
-                        </button>
+            <div class="panel">
+                <div class="list-controls">
+                    <h2 style="margin: 0; border: none; padding: 0;"><i class="fas fa-list"></i> Items List</h2>
+                    <div class="search-box">
+                        <i class="fas fa-search"></i>
+                        <input type="text" id="searchInput" placeholder="Search items...">
+                    </div>
+                    <button class="btn-secondary" onclick="loadItems()" id="refreshBtn">
+                        <i class="fas fa-sync-alt"></i> Refresh
+                    </button>
+                </div>
+                
+                <div class="stats" id="stats">Loading...</div>
+                
+                <div class="item-list-container" id="itemListContainer">
+                    <div class="item-list" id="itemList">
+                        <div class="loading">
+                            <i class="fas fa-spinner"></i>
+                            Loading items...
+                        </div>
                     </div>
                 </div>
                 
-                <div class="item-list" id="itemList">
-                    <div class="loading">
-                        <div class="loading-spinner"></div>
-                        <p>Loading items...</p>
-                    </div>
+                <div class="pagination" id="pagination" style="display: none;">
+                    <button onclick="changePage(-1)" id="prevBtn"><i class="fas fa-chevron-left"></i></button>
+                    <span id="pageInfo">Page 1 of 1</span>
+                    <button onclick="changePage(1)" id="nextBtn"><i class="fas fa-chevron-right"></i></button>
+                </div>
+            </div>
+
+            <div class="panel json-panel">
+                <div class="json-header">
+                    <h2><i class="fas fa-code"></i> API Response</h2>
+                    <button class="copy-btn" onclick="copyJSON()">
+                        <i class="far fa-copy"></i> Copy JSON
+                    </button>
+                </div>
+                <div class="json-output" id="jsonOutput">
+                    // API response will appear here...
                 </div>
             </div>
         </div>
+
+        <div class="footer">
+            <p>Built with Cloudflare Workers + D1 Database | REST API CRUD Application</p>
+            <p>Database Schema: <code>items(id, name, description, created_at)</code></p>
+        </div>
     </div>
 
-    <!-- SweetAlert JS -->
-    <script src="https://cdn.jsdelivr.net/npm/sweetalert2@11"></script>
-    
     <script>
-        // Configuration
         const API_BASE_URL = window.location.origin + '/api/items';
-        let isEditing = false;
         let currentEditId = null;
+        let currentItems = [];
+        let currentPage = 1;
+        const itemsPerPage = 5;
+        let totalPages = 1;
+        let searchQuery = '';
 
         // DOM Elements
         const itemForm = document.getElementById('itemForm');
         const itemList = document.getElementById('itemList');
+        const itemListContainer = document.getElementById('itemListContainer');
         const alertDiv = document.getElementById('alert');
         const jsonOutput = document.getElementById('jsonOutput');
         const submitBtn = document.getElementById('submitBtn');
         const updateBtn = document.getElementById('updateBtn');
         const cancelBtn = document.getElementById('cancelBtn');
-        const nameInput = document.getElementById('name');
-        const descInput = document.getElementById('description');
-        const itemIdInput = document.getElementById('itemId');
+        const searchInput = document.getElementById('searchInput');
+        const refreshBtn = document.getElementById('refreshBtn');
+        const paginationDiv = document.getElementById('pagination');
+        const prevBtn = document.getElementById('prevBtn');
+        const nextBtn = document.getElementById('nextBtn');
+        const pageInfo = document.getElementById('pageInfo');
+        const stats = document.getElementById('stats');
 
-        // Initialize
-        document.addEventListener('DOMContentLoaded', () => {
-            loadItems();
-            setupEventListeners();
-        });
-
-        // Setup event listeners
-        function setupEventListeners() {
-            // Form submission
-            itemForm.addEventListener('submit', handleSubmit);
-            
-            // Update button
-            updateBtn.addEventListener('click', handleUpdate);
-            
-            // Cancel button
-            cancelBtn.addEventListener('click', cancelEdit);
-            
-            // Real-time JSON preview
-            nameInput.addEventListener('input', updateJsonPreview);
-            descInput.addEventListener('input', updateJsonPreview);
-        }
-
-        // Show SweetAlert notification
-        function showSweetAlert(title, text, icon = 'success', confirmButtonText = 'OK') {
-            return Swal.fire({
-                title: title,
-                text: text,
-                icon: icon,
-                confirmButtonText: confirmButtonText,
-                confirmButtonColor: '#6a11cb',
-                timer: icon === 'success' ? 3000 : undefined,
-                timerProgressBar: icon === 'success',
-                showClass: {
-                    popup: 'animate__animated animate__fadeInDown'
-                },
-                hideClass: {
-                    popup: 'animate__animated animate__fadeOutUp'
-                }
-            });
-        }
-
-        // Show regular alert
+        // Show alert message
         function showAlert(message, type = 'success') {
             alertDiv.textContent = message;
-            alertDiv.className = 'alert alert-' + (type === 'error' ? 'error' : 'success');
+            alertDiv.className = 'alert alert-' + type;
             alertDiv.style.display = 'block';
             
-            setTimeout(() => {
-                alertDiv.style.display = 'none';
-            }, 5000);
+            // Auto-hide success messages after 5 seconds
+            if (type === 'success') {
+                setTimeout(() => {
+                    alertDiv.style.display = 'none';
+                }, 5000);
+            }
         }
 
-        // Update JSON preview
-        function updateJsonPreview() {
-            const data = {
-                name: nameInput.value,
-                description: descInput.value
-            };
-            
-            if (currentEditId) {
-                data.id = currentEditId;
-            }
-            
+        // Update JSON output display
+        function updateJsonOutput(data) {
             jsonOutput.textContent = JSON.stringify(data, null, 2);
         }
 
-        // Load all items
-        async function loadItems() {
+        // Copy JSON to clipboard
+        function copyJSON() {
+            navigator.clipboard.writeText(jsonOutput.textContent)
+                .then(() => showAlert('JSON copied to clipboard!', 'success'))
+                .catch(err => showAlert('Failed to copy JSON: ' + err, 'error'));
+        }
+
+        // Load all items with pagination
+        async function loadItems(page = 1) {
             try {
-                itemList.innerHTML = '<div class="loading"><div class="loading-spinner"></div><p>Loading items...</p></div>';
+                currentPage = page;
+                itemList.innerHTML = '<div class="loading"><i class="fas fa-spinner"></i>Loading items...</div>';
+                refreshBtn.disabled = true;
                 
-                const response = await fetch(API_BASE_URL);
+                // Build URL with pagination
+                let url = API_BASE_URL + '?page=' + page + '&limit=' + itemsPerPage;
                 
+                const response = await fetch(url);
                 if (!response.ok) {
-                    throw new Error('HTTP error! status: ' + response.status);
+                    throw new Error('HTTP ' + response.status + ': ' + response.statusText);
                 }
                 
-                const items = await response.json();
+                const data = await response.json();
+                currentItems = data.items || [];
+                totalPages = data.pagination?.pages || 1;
                 
-                if (!items || items.length === 0) {
-                    itemList.innerHTML = '<div class="no-items"><div style="font-size: 48px; margin-bottom: 15px;">📭</div><h3>No Items Found</h3><p>Create your first item using the form on the left!</p></div>';
+                // Update stats
+                stats.textContent = 'Showing ' + currentItems.length + ' of ' + (data.pagination?.total || 0) + ' items';
+                
+                if (currentItems.length === 0) {
+                    itemList.innerHTML = '<div class="empty-state"><i class="fas fa-box-open"></i><h3>No items found</h3><p>Create your first item using the form!</p></div>';
+                    paginationDiv.style.display = 'none';
+                    updateJsonOutput(data);
                     return;
                 }
 
-                renderItems(items);
+                // Apply search filter if any
+                let filteredItems = currentItems;
+                if (searchQuery) {
+                    const query = searchQuery.toLowerCase();
+                    filteredItems = currentItems.filter(item => 
+                        item.name.toLowerCase().includes(query) || 
+                        (item.description && item.description.toLowerCase().includes(query))
+                    );
+                }
+
+                // Render items
+                itemList.innerHTML = '';
+                filteredItems.forEach(item => {
+                    const itemDiv = document.createElement('div');
+                    itemDiv.className = 'item-card' + (currentEditId === item.id ? ' editing' : '');
+                    itemDiv.innerHTML = '<div class="item-id">#' + item.id + '</div>' +
+                                        '<h3>' + escapeHtml(item.name) + '</h3>' +
+                                        '<p>' + (item.description ? escapeHtml(item.description) : '<em>No description</em>') + '</p>' +
+                                        '<div class="meta">' +
+                                        '<span><i class="far fa-clock"></i> Created: ' + new Date(item.created_at).toLocaleDateString() + '</span>' +
+                                        '<span><i class="far fa-calendar"></i> ' + new Date(item.created_at).toLocaleTimeString() + '</span>' +
+                                        '</div>' +
+                                        '<div class="item-actions">' +
+                                        '<button class="btn-update" onclick="editItem(' + item.id + ')"><i class="fas fa-edit"></i> Edit</button>' +
+                                        '<button class="btn-danger" onclick="deleteItem(' + item.id + ')"><i class="fas fa-trash"></i> Delete</button>' +
+                                        '</div>';
+                    itemList.appendChild(itemDiv);
+                });
+
+                // Update pagination controls
+                updatePagination();
+                updateJsonOutput(data);
+                
             } catch (error) {
                 console.error('Error loading items:', error);
-                itemList.innerHTML = '<div class="no-items" style="color: #ff416c;"><div style="font-size: 48px; margin-bottom: 15px;">⚠️</div><h3>Error Loading Items</h3><p>' + error.message + '</p><button class="btn btn-secondary" onclick="loadItems()" style="margin-top: 15px;">Retry</button></div>';
+                itemList.innerHTML = '<div class="empty-state"><i class="fas fa-exclamation-triangle"></i><h3>Error loading items</h3><p>' + error.message + '</p></div>';
+                showAlert('Error loading items: ' + error.message, 'error');
+                updateJsonOutput({ error: error.message });
+            } finally {
+                refreshBtn.disabled = false;
             }
         }
 
-        // Render items list
-        function renderItems(items) {
-            itemList.innerHTML = '';
-            
-            items.forEach(item => {
-                const itemElement = document.createElement('div');
-                itemElement.className = 'item-card';
-                itemElement.innerHTML = '<div class="item-header"><h3 class="item-title">' + item.name + '</h3><span class="item-id">ID: ' + item.id + '</span></div><p class="item-description">' + (item.description || '<em>No description</em>') + '</p><div class="item-meta"><div class="item-date"><span>📅 ' + new Date(item.created_at).toLocaleDateString() + '</span><span>⏰ ' + new Date(item.created_at).toLocaleTimeString() + '</span></div><div class="item-actions"><button class="btn btn-warning" onclick="editItem(' + item.id + ')" title="Edit">✏️ Edit</button><button class="btn btn-danger" onclick="deleteItemWithConfirm(' + item.id + ')" title="Delete">🗑️ Delete</button></div></div>';
-                itemList.appendChild(itemElement);
-            });
-        }
-
-        // Handle form submission (Create)
-        async function handleSubmit(e) {
-            e.preventDefault();
-            
-            const name = nameInput.value.trim();
-            const description = descInput.value.trim();
-            
-            if (!name) {
-                await showSweetAlert('Validation Error', 'Item name is required!', 'error');
-                nameInput.focus();
+        // Update pagination controls
+        function updatePagination() {
+            if (totalPages <= 1) {
+                paginationDiv.style.display = 'none';
                 return;
             }
             
-            try {
-                const response = await fetch(API_BASE_URL, {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ name, description })
-                });
-                
-                const result = await response.json();
-                
-                if (!response.ok) {
-                    throw new Error(result.error || 'Failed to create item');
-                }
-                
-                await showSweetAlert('Success!', 'Item created successfully!', 'success');
-                
-                // Reset form and reload items
-                clearForm();
-                loadItems();
-                updateJsonPreview();
-                
-            } catch (error) {
-                console.error('Error creating item:', error);
-                await showSweetAlert('Error', 'Failed to create item: ' + error.message, 'error');
+            paginationDiv.style.display = 'flex';
+            prevBtn.disabled = currentPage <= 1;
+            nextBtn.disabled = currentPage >= totalPages;
+            pageInfo.textContent = 'Page ' + currentPage + ' of ' + totalPages;
+        }
+
+        // Change page
+        function changePage(delta) {
+            const newPage = currentPage + delta;
+            if (newPage >= 1 && newPage <= totalPages) {
+                loadItems(newPage);
             }
         }
 
-        // Handle update (for Update button)
-        async function handleUpdate() {
-            if (!currentEditId) return;
-            
-            const name = nameInput.value.trim();
-            const description = descInput.value.trim();
-            
-            if (!name) {
-                await showSweetAlert('Validation Error', 'Item name is required!', 'error');
-                nameInput.focus();
-                return;
-            }
-            
-            try {
-                const response = await fetch(API_BASE_URL + '/' + currentEditId, {
-                    method: 'PUT',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ name, description })
-                });
-                
-                const result = await response.json();
-                
-                if (!response.ok) {
-                    throw new Error(result.error || 'Failed to update item');
-                }
-                
-                await showSweetAlert('Success!', 'Item updated successfully!', 'success');
-                
-                // Reset form and reload items
-                cancelEdit();
-                loadItems();
-                
-            } catch (error) {
-                console.error('Error updating item:', error);
-                await showSweetAlert('Error', 'Failed to update item: ' + error.message, 'error');
-            }
+        // Escape HTML to prevent XSS
+        function escapeHtml(text) {
+            if (!text) return '';
+            const div = document.createElement('div');
+            div.textContent = text;
+            return div.innerHTML;
         }
 
-        // Edit item with SweetAlert form
+        // Edit item function
         async function editItem(id) {
             try {
-                // Show loading
-                const loadingAlert = await Swal.fire({
-                    title: 'Loading item...',
-                    allowOutsideClick: false,
-                    didOpen: () => {
-                        Swal.showLoading();
-                    }
-                });
+                showAlert('Loading item details...', 'info');
                 
                 const response = await fetch(API_BASE_URL + '/' + id);
+                if (!response.ok) {
+                    throw new Error('HTTP ' + response.status);
+                }
+                
                 const item = await response.json();
                 
-                Swal.close();
-                
                 if (item.error) {
-                    await showSweetAlert('Error', item.error, 'error');
+                    showAlert(item.error, 'error');
                     return;
                 }
+
+                currentEditId = id;
+                document.getElementById('itemId').value = id;
+                document.getElementById('name').value = item.name;
+                document.getElementById('description').value = item.description || '';
                 
-                // Use SweetAlert for editing
-                const { value: formValues } = await Swal.fire({
-                    title: 'Edit Item',
-                    html: '<input id="swal-name" class="swal2-input" placeholder="Item name" value="' + item.name + '"><textarea id="swal-description" class="swal2-textarea" placeholder="Description">' + (item.description || '') + '</textarea>',
-                    focusConfirm: false,
-                    showCancelButton: true,
-                    confirmButtonText: 'Update',
-                    cancelButtonText: 'Cancel',
-                    confirmButtonColor: '#6a11cb',
-                    preConfirm: () => {
-                        const name = document.getElementById('swal-name').value.trim();
-                        const description = document.getElementById('swal-description').value.trim();
-                        
-                        if (!name) {
-                            Swal.showValidationMessage('Item name is required');
-                            return false;
-                        }
-                        
-                        return { name, description };
-                    }
-                });
+                // Show update button, hide submit button
+                submitBtn.style.display = 'none';
+                updateBtn.style.display = 'block';
+                cancelBtn.style.display = 'block';
                 
-                if (formValues) {
-                    // Update via API
-                    const updateResponse = await fetch(API_BASE_URL + '/' + id, {
-                        method: 'PUT',
-                        headers: { 'Content-Type': 'application/json' },
-                        body: JSON.stringify(formValues)
-                    });
-                    
-                    const result = await updateResponse.json();
-                    
-                    if (!updateResponse.ok) {
-                        throw new Error(result.error || 'Failed to update item');
-                    }
-                    
-                    await showSweetAlert('Success!', 'Item updated successfully!', 'success');
-                    loadItems();
-                }
+                updateJsonOutput(item);
+                showAlert('Now editing item #' + id + ' - "' + item.name + '"', 'info');
+                
+                // Highlight the item being edited
+                loadItems(currentPage);
                 
             } catch (error) {
-                console.error('Error editing item:', error);
-                await showSweetAlert('Error', 'Failed to edit item: ' + error.message, 'error');
+                console.error('Error loading item:', error);
+                showAlert('Error loading item: ' + error.message, 'error');
             }
         }
 
-        // Delete item with SweetAlert confirmation
-        async function deleteItemWithConfirm(id) {
+        // Handle form submission for create/update
+        itemForm.addEventListener('submit', async (e) => {
+            e.preventDefault();
+            
+            const id = document.getElementById('itemId').value;
+            const name = document.getElementById('name').value.trim();
+            const description = document.getElementById('description').value.trim();
+
+            if (!name) {
+                showAlert('Name is required!', 'error');
+                return;
+            }
+
+            const itemData = { 
+                name: name, 
+                description: description || null 
+            };
+            
+            const isUpdate = !!currentEditId;
+            
+            // Disable buttons during request
+            submitBtn.disabled = true;
+            updateBtn.disabled = true;
+
             try {
-                // Get item details for confirmation message
-                const response = await fetch(API_BASE_URL + '/' + id);
-                const item = await response.json();
+                let response, result;
                 
-                if (item.error) {
-                    await showSweetAlert('Error', 'Item not found', 'error');
-                    return;
-                }
-                
-                const result = await Swal.fire({
-                    title: 'Are you sure?',
-                    html: '<p>You are about to delete:</p><div style="text-align: left; background: #f8f9fa; padding: 15px; border-radius: 8px; margin: 15px 0;"><strong>' + item.name + '</strong><br><small>' + (item.description || 'No description') + '</small></div><p style="color: #ff416c; font-weight: bold;">This action cannot be undone!</p>',
-                    icon: 'warning',
-                    showCancelButton: true,
-                    confirmButtonColor: '#ff416c',
-                    cancelButtonColor: '#95a5a6',
-                    confirmButtonText: 'Yes, delete it!',
-                    cancelButtonText: 'Cancel',
-                    reverseButtons: true,
-                    showClass: {
-                        popup: 'animate__animated animate__headShake'
+                if (isUpdate) {
+                    // Update existing item
+                    showAlert('Updating item...', 'info');
+                    response = await fetch(API_BASE_URL + '/' + currentEditId, {
+                        method: 'PUT',
+                        headers: { 
+                            'Content-Type': 'application/json',
+                            'Accept': 'application/json'
+                        },
+                        body: JSON.stringify(itemData)
+                    });
+                    result = await response.json();
+                    
+                    if (response.ok) {
+                        showAlert('✅ Item updated successfully!', 'success');
+                    } else {
+                        throw new Error(result.error || 'Update failed with status ' + response.status);
                     }
+                } else {
+                    // Create new item
+                    showAlert('Creating item...', 'info');
+                    response = await fetch(API_BASE_URL, {
+                        method: 'POST',
+                        headers: { 
+                            'Content-Type': 'application/json',
+                            'Accept': 'application/json'
+                        },
+                        body: JSON.stringify(itemData)
+                    });
+                    result = await response.json();
+                    
+                    if (response.status === 201) {
+                        showAlert('✅ Item created successfully!', 'success');
+                    } else {
+                        throw new Error(result.error || 'Creation failed with status ' + response.status);
+                    }
+                }
+
+                updateJsonOutput(result);
+                
+                // Reset form and reload items
+                resetForm();
+                loadItems();
+                
+            } catch (error) {
+                console.error('Error saving item:', error);
+                showAlert('❌ Error: ' + error.message, 'error');
+                updateJsonOutput({ error: error.message });
+            } finally {
+                submitBtn.disabled = false;
+                updateBtn.disabled = false;
+            }
+        });
+
+        // Add click handler for update button
+        updateBtn.addEventListener('click', (e) => {
+            // Trigger form submission
+            itemForm.dispatchEvent(new Event('submit'));
+        });
+
+        // Delete item
+        async function deleteItem(id) {
+            if (!confirm('Are you sure you want to delete this item? This action cannot be undone.')) {
+                return;
+            }
+
+            const deleteBtn = event?.target || document.querySelector('button[onclick="deleteItem(' + id + ')"]');
+            if (deleteBtn) deleteBtn.disabled = true;
+
+            try {
+                showAlert('Deleting item...', 'info');
+                const response = await fetch(API_BASE_URL + '/' + id, {
+                    method: 'DELETE'
                 });
                 
-                if (result.isConfirmed) {
-                    // Show deleting animation
-                    const deleteAlert = await Swal.fire({
-                        title: 'Deleting...',
-                        allowOutsideClick: false,
-                        didOpen: () => {
-                            Swal.showLoading();
-                        }
-                    });
+                const result = await response.json();
+                
+                if (response.ok) {
+                    showAlert('🗑️ Item deleted successfully!', 'success');
+                    updateJsonOutput(result);
                     
-                    const deleteResponse = await fetch(API_BASE_URL + '/' + id, {
-                        method: 'DELETE'
-                    });
-                    
-                    Swal.close();
-                    
-                    if (!deleteResponse.ok) {
-                        const errorResult = await deleteResponse.json();
-                        throw new Error(errorResult.error || 'Failed to delete item');
+                    // If we're editing this item, cancel edit
+                    if (currentEditId === id) {
+                        resetForm();
                     }
                     
-                    await showSweetAlert('Deleted!', 'Item has been deleted.', 'success');
-                    loadItems();
+                    // Reload items
+                    loadItems(currentPage);
+                } else {
+                    throw new Error(result.error || 'Delete failed with status ' + response.status);
                 }
                 
             } catch (error) {
                 console.error('Error deleting item:', error);
-                await showSweetAlert('Error', 'Failed to delete item: ' + error.message, 'error');
+                showAlert('❌ Error deleting item: ' + error.message, 'error');
+                updateJsonOutput({ error: error.message });
+            } finally {
+                if (deleteBtn) deleteBtn.disabled = false;
             }
         }
 
-        // Set form to edit mode
-        function setEditMode(item) {
-            isEditing = true;
-            currentEditId = item.id;
-            
-            // Fill form
-            nameInput.value = item.name;
-            descInput.value = item.description || '';
-            itemIdInput.value = item.id;
-            
-            // Toggle buttons
-            submitBtn.classList.add('hidden');
-            updateBtn.classList.remove('hidden');
-            cancelBtn.classList.remove('hidden');
-            
-            // Focus on name field
-            nameInput.focus();
-            
-            // Update JSON preview
-            updateJsonPreview();
-            
-            // Show alert
-            showAlert('Editing item #' + item.id + ' - "' + item.name + '"', 'success');
-        }
-
-        // Cancel edit mode
-        function cancelEdit() {
-            isEditing = false;
-            currentEditId = null;
-            
-            // Clear form
-            clearForm();
-            
-            // Toggle buttons
-            submitBtn.classList.remove('hidden');
-            updateBtn.classList.add('hidden');
-            cancelBtn.classList.add('hidden');
-            
-            // Update JSON preview
-            updateJsonPreview();
-            
-            showAlert('Edit cancelled', 'success');
-        }
-
-        // Clear form
-        function clearForm() {
+        // Reset form
+        function resetForm() {
             itemForm.reset();
-            itemIdInput.value = '';
-            updateJsonPreview();
-        }
-
-        // Quick action: Delete with single click confirmation
-        async function quickDelete(id) {
-            const result = await Swal.fire({
-                title: 'Quick Delete?',
-                text: 'This will delete the item immediately.',
-                icon: 'question',
-                showCancelButton: true,
-                confirmButtonColor: '#ff416c',
-                cancelButtonColor: '#95a5a6',
-                confirmButtonText: 'Delete',
-                cancelButtonText: 'Cancel'
-            });
+            currentEditId = null;
+            document.getElementById('itemId').value = '';
+            submitBtn.style.display = 'block';
+            updateBtn.style.display = 'none';
+            cancelBtn.style.display = 'none';
             
-            if (result.isConfirmed) {
-                await deleteItemWithConfirm(id);
-            }
+            // Remove editing highlight
+            loadItems(currentPage);
         }
 
-        // Export functions to global scope
+        // Cancel edit
+        cancelBtn.addEventListener('click', resetForm);
+
+        // Search functionality
+        let searchTimeout;
+        searchInput.addEventListener('input', (e) => {
+            searchQuery = e.target.value;
+            clearTimeout(searchTimeout);
+            searchTimeout = setTimeout(() => {
+                loadItems(1);
+            }, 300);
+        });
+
+        // Initialize
+        document.addEventListener('DOMContentLoaded', () => {
+            loadItems();
+            
+            // Test API connection
+            fetch(API_BASE_URL)
+                .then(response => {
+                    if (response.ok) {
+                        showAlert('✅ Connected to API successfully', 'success');
+                    } else {
+                        showAlert('⚠️ API responded with status: ' + response.status, 'error');
+                    }
+                })
+                .catch(err => showAlert('❌ API connection error: ' + err.message, 'error'));
+        });
+
+        // Make functions available globally for onclick handlers
         window.loadItems = loadItems;
         window.editItem = editItem;
-        window.deleteItemWithConfirm = deleteItemWithConfirm;
-        window.clearForm = clearForm;
-        window.quickDelete = quickDelete;
+        window.deleteItem = deleteItem;
+        window.changePage = changePage;
+        window.copyJSON = copyJSON;
     </script>
 </body>
 </html>`;
 }
+

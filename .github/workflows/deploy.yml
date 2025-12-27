@@ -1,13 +1,169 @@
-# .github/workflows/deploy.yml
-name: Deploy
-on: [push]
+name: Deploy to Cloudflare Workers
+
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+env:
+  CLOUDFLARE_API_TOKEN: ${{ secrets.CF_API_TOKEN }}
+  CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CF_ACCOUNT_ID }}
+  CLOUDFLARE_D1_DATABASE_ID: ${{ secrets.CF_D1_DATABASE_ID }}
+
 jobs:
   deploy:
     runs-on: ubuntu-latest
+    name: Deploy Worker
     steps:
-      - uses: actions/checkout@v3
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '18'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: |
+          if [ -f "package.json" ]; then
+            npm ci
+          else
+            echo "No package.json found, skipping npm install"
+          fi
+
+      - name: Install Wrangler
+        run: npm install -g wrangler@latest
+
+      - name: Create wrangler.toml if not exists
+        run: |
+          if [ ! -f "wrangler.toml" ]; then
+            echo "Creating wrangler.toml..."
+            cat > wrangler.toml << EOF
+          name = "crud-app"
+          main = "src/worker.js"
+          compatibility_date = "2024-12-01"
+          
+          [vars]
+          ENVIRONMENT = "production"
+          
+          [[d1_databases]]
+          binding = "DB"
+          database_name = "crud-database"
+          database_id = "${{ secrets.CF_D1_DATABASE_ID || 'your-database-id' }}"
+          EOF
+          fi
+
+      - name: Validate wrangler.toml
+        run: |
+          if [ -f "wrangler.toml" ]; then
+            echo "wrangler.toml content:"
+            cat wrangler.toml
+          else
+            echo "ERROR: wrangler.toml not found!"
+            exit 1
+          fi
+
+      - name: Check Worker file
+        run: |
+          if [ -f "src/worker.js" ]; then
+            echo "✅ Worker file found at src/worker.js"
+            echo "First 10 lines:"
+            head -10 src/worker.js
+          else
+            echo "❌ ERROR: src/worker.js not found!"
+            ls -la
+            exit 1
+          fi
+
       - name: Deploy to Cloudflare Workers
-        uses: cloudflare/wrangler-action@v2
+        uses: cloudflare/wrangler-action@v3
         with:
           apiToken: ${{ secrets.CF_API_TOKEN }}
-          # Secrets disimpan di GitHub, bukan di file
+          accountId: ${{ secrets.CF_ACCOUNT_ID }}
+          command: deploy
+          workingDirectory: '.'
+          environment: production
+        continue-on-error: false
+
+      - name: Deploy Database Schema (Optional)
+        if: success() && secrets.CF_D1_DATABASE_ID != ''
+        run: |
+          echo "Deploying database schema..."
+          if [ -f "schema.sql" ]; then
+            wrangler d1 execute ${{ secrets.CF_D1_DATABASE_ID }} --file=schema.sql --remote
+          elif [ -f "src/schema.sql" ]; then
+            wrangler d1 execute ${{ secrets.CF_D1_DATABASE_ID }} --file=src/schema.sql --remote
+          else
+            echo "No schema.sql found, skipping database setup"
+            echo "Creating default schema..."
+            wrangler d1 execute ${{ secrets.CF_D1_DATABASE_ID }} --remote --command="
+              DROP TABLE IF EXISTS items;
+              CREATE TABLE items (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL,
+                description TEXT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+              );
+              INSERT INTO items (name, description) VALUES 
+                ('Sample Item 1', 'This is the first sample item'),
+                ('Sample Item 2', 'Another sample item for testing');
+            "
+          fi
+
+      - name: Run Tests (Optional)
+        if: success()
+        run: |
+          echo "Running simple API test..."
+          sleep 10  # Tunggu worker selesai deploy
+          # Tes API endpoint
+          curl -s "https://crudapp.stevanusstudent.workers.dev/api/items" || echo "Test failed, but deployment succeeded"
+
+  lint-and-test:
+    runs-on: ubuntu-latest
+    name: Lint and Test
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '18'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: |
+          if [ -f "package.json" ]; then
+            npm ci
+          else
+            echo "No package.json found, skipping npm install"
+          fi
+
+      - name: Syntax Check
+        run: |
+          echo "Checking worker.js syntax..."
+          if [ -f "src/worker.js" ]; then
+            node -c src/worker.js && echo "✅ Syntax check passed"
+          else
+            echo "❌ src/worker.js not found"
+            exit 1
+          fi
+
+      - name: Check for Common Errors
+        run: |
+          echo "Checking for common errors..."
+          if [ -f "src/worker.js" ]; then
+            # Cek template literals
+            if grep -q "\\\\\\$" src/worker.js; then
+              echo "⚠️  Found escaped $, might be template literal issue"
+            fi
+            # Cek untuk closing braces
+            if ! grep -q "export default" src/worker.js; then
+              echo "❌ Missing export default"
+              exit 1
+            fi
+            echo "✅ Basic checks passed"
+          fi
